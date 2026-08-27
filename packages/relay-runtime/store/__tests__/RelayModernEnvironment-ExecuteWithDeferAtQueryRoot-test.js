@@ -50,7 +50,10 @@ describe.each(['RelayModernEnvironment', 'MultiActorEnvironment'])(
     let error;
     let next;
 
-    const createEnvironment = (getDataID?: $FlowFixMe) => {
+    const createEnvironment = (
+      getDataID?: $FlowFixMe,
+      deferDeduplicatedFields?: boolean,
+    ) => {
       const fetch = (
         _query: RequestParameters,
         _variables: Variables,
@@ -67,6 +70,7 @@ describe.each(['RelayModernEnvironment', 'MultiActorEnvironment'])(
         createNetworkForActor: _actorID => RelayNetwork.create(fetch),
         createStoreForActor: _actorID => store,
         getDataID,
+        deferDeduplicatedFields,
       });
       return environmentType === 'MultiActorEnvironment'
         ? multiActorEnvironment.forActor(getActorIdentifier('actor:1234'))
@@ -74,6 +78,7 @@ describe.each(['RelayModernEnvironment', 'MultiActorEnvironment'])(
             network: RelayNetwork.create(fetch),
             store,
             getDataID,
+            deferDeduplicatedFields,
           });
     };
 
@@ -269,6 +274,214 @@ describe.each(['RelayModernEnvironment', 'MultiActorEnvironment'])(
           viewer: {account_user: {name: 'Alice'}},
         });
         expect(environment.check(operation).status).toBe('available');
+      });
+
+      it('resolves a sub-path chunk against a sibling published in the same batch', () => {
+        environment = createEnvironment(undefined, true);
+
+        const query = graphql`
+          query RelayModernEnvironmentExecuteWithDeferAtQueryRootTestBatchQuery {
+            me {
+              id
+            }
+            ...RelayModernEnvironmentExecuteWithDeferAtQueryRootTestBatchFragment
+              @dangerously_unaliased_fixme
+              @defer(label: "BatchFragment")
+          }
+        `;
+        const fragment = graphql`
+          fragment RelayModernEnvironmentExecuteWithDeferAtQueryRootTestBatchFragment on Query {
+            viewer {
+              account_user {
+                id
+                name
+              }
+            }
+          }
+        `;
+        const operation = createOperationDescriptor(query, {});
+        const selector = createReaderSelector(
+          fragment,
+          ROOT_ID,
+          {},
+          operation.request,
+        );
+        const label =
+          'RelayModernEnvironmentExecuteWithDeferAtQueryRootTestBatchQuery$defer$BatchFragment';
+
+        environment.execute({operation}).subscribe(callbacks);
+        dataSource.next({
+          data: {me: {id: 'me-1'}},
+        });
+        jest.runAllTimers();
+        next.mockClear();
+
+        // Both chunks are published together: the first links account_user and
+        // gives it an id, the second is addressed at that link and — because
+        // the server omits an already-delivered field — carries no id of its
+        // own. Resolving it against the store alone fails, since the batch is
+        // published once, after every chunk in it has been normalized.
+        dataSource.next([
+          {
+            data: {viewer: {account_user: {id: '100'}}},
+            label,
+            path: [],
+          },
+          {
+            data: {name: 'Alice'},
+            label,
+            path: ['viewer', 'account_user'],
+          },
+        ]);
+
+        expect(error.mock.calls.map(call => call[0].message)).toEqual([]);
+        const snapshot = environment.lookup(selector);
+        expect(snapshot.isMissingData).toBe(false);
+        expect(snapshot.data).toEqual({
+          viewer: {account_user: {id: '100', name: 'Alice'}},
+        });
+      });
+
+      it('reports an operation whose initial payload writes nothing as pending', () => {
+        const query = graphql`
+          query RelayModernEnvironmentExecuteWithDeferAtQueryRootTestEmptyQuery {
+            ...RelayModernEnvironmentExecuteWithDeferAtQueryRootTestEmptyFragment
+              @dangerously_unaliased_fixme
+              @defer(label: "EmptyFragment")
+          }
+        `;
+        const fragment = graphql`
+          fragment RelayModernEnvironmentExecuteWithDeferAtQueryRootTestEmptyFragment on Query {
+            viewer {
+              isFbEmployee
+            }
+          }
+        `;
+        const operation = createOperationDescriptor(query, {});
+        const selector = createReaderSelector(
+          fragment,
+          ROOT_ID,
+          {},
+          operation.request,
+        );
+
+        environment.execute({operation}).subscribe(callbacks);
+        // Every root selection is deferred, so the initial payload is empty
+        // and writes no records. Readers of the deferred fragments still need
+        // the operation to count as in flight, or a missing-data read renders
+        // as final instead of suspending.
+        dataSource.next({data: {}});
+        jest.runAllTimers();
+
+        expect(
+          environment
+            .getOperationTracker()
+            .getPendingOperationsAffectingOwner(operation.request),
+        ).not.toBe(null);
+
+        dataSource.next({
+          data: {viewer: {isFbEmployee: true}},
+          label:
+            'RelayModernEnvironmentExecuteWithDeferAtQueryRootTestEmptyQuery$defer$EmptyFragment',
+          path: [],
+        });
+        dataSource.complete();
+
+        expect(error).toBeCalledTimes(0);
+        expect(complete).toBeCalledTimes(1);
+        const snapshot = environment.lookup(selector);
+        expect(snapshot.isMissingData).toBe(false);
+        expect(snapshot.data).toEqual({viewer: {isFbEmployee: true}});
+        expect(
+          environment
+            .getOperationTracker()
+            .getPendingOperationsAffectingOwner(operation.request),
+        ).toBe(null);
+      });
+
+      it('drains a queued chunk whose @defer sits inside a linked field of its parent', () => {
+        environment = createEnvironment(undefined, true);
+
+        const query = graphql`
+          query RelayModernEnvironmentExecuteWithDeferAtQueryRootTestQueuedQuery {
+            me {
+              id
+            }
+            ...RelayModernEnvironmentExecuteWithDeferAtQueryRootTestQueuedOuter
+              @dangerously_unaliased_fixme
+              @defer(label: "QueuedOuter")
+          }
+        `;
+        graphql`
+          fragment RelayModernEnvironmentExecuteWithDeferAtQueryRootTestQueuedOuter on Query {
+            viewer {
+              account_user {
+                id
+                ...RelayModernEnvironmentExecuteWithDeferAtQueryRootTestQueuedInner
+                  @dangerously_unaliased_fixme
+                  @defer(label: "QueuedInner")
+              }
+            }
+          }
+        `;
+        const innerFragment = graphql`
+          fragment RelayModernEnvironmentExecuteWithDeferAtQueryRootTestQueuedInner on User {
+            name
+            allPhones {
+              isVerified
+            }
+          }
+        `;
+        const operation = createOperationDescriptor(query, {});
+        const innerSelector = createReaderSelector(
+          innerFragment,
+          '100',
+          {},
+          operation.request,
+        );
+
+        environment.execute({operation}).subscribe(callbacks);
+        dataSource.next({
+          data: {me: {id: 'me-1'}},
+        });
+        jest.runAllTimers();
+        next.mockClear();
+
+        // The inner @defer sits inside the outer fragment's `viewer` field, so
+        // it is not one of the outer selector's own selections: its placeholder
+        // appears only once the outer chunk is normalized. The batch publishes
+        // both at once and the inner chunk is processed first, so it is queued
+        // — at ['viewer', 'account_user'], deeper than the ['·'] path the
+        // placeholder will register at.
+        const innerLabel =
+          'RelayModernEnvironmentExecuteWithDeferAtQueryRootTestQueuedOuter$defer$QueuedInner';
+        dataSource.next([
+          {
+            data: {name: 'Alice', allPhones: [{}]},
+            label: innerLabel,
+            path: ['viewer', 'account_user'],
+          },
+          // Addressed a link below where the inner placeholder registers, so
+          // it lands in its own queue bucket rather than the placeholder's.
+          {
+            data: {isVerified: true},
+            label: innerLabel,
+            path: ['viewer', 'account_user', 'allPhones', 0],
+          },
+          {
+            data: {viewer: {account_user: {id: '100'}}},
+            label:
+              'RelayModernEnvironmentExecuteWithDeferAtQueryRootTestQueuedQuery$defer$QueuedOuter',
+            path: [],
+          },
+        ]);
+
+        expect(error.mock.calls.map(call => call[0].message)).toEqual([]);
+        const snapshot = environment.lookup(innerSelector);
+        expect(snapshot.data).toEqual({
+          name: 'Alice',
+          allPhones: [{isVerified: true}],
+        });
       });
     });
   },
